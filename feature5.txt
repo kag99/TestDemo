@@ -154,4 +154,111 @@ struct BandButton: View {
     }
 }
 
+class Coordinator: NSObject, ARSessionDelegate {
+    var watchAnchor: AnchorEntity?
+    var watchEntity: Entity?
+    var handRequest = VNDetectHumanHandPoseRequest()
+    
+    // Stability Variables
+    var framesWithoutHand = 0
+    let maxMissingFrames = 20 // Approx 0.6 seconds of "memory"
+    var lastValidTransform: Transform?
+    
+    func setupWatch(in arView: ARView) {
+        // Create a single persistent anchor at the start
+        let anchor = AnchorEntity(world: .zero)
+        
+        if let model = try? Entity.load(named: "watch") {
+            model.name = "WatchModel"
+            anchor.addChild(model)
+            self.watchEntity = model
+        }
+        
+        // Occluder setup remains the same
+        let occluderMesh = MeshResource.generateCylinder(height: 0.2, radius: 0.032)
+        let occluder = ModelEntity(mesh: occluderMesh, materials: [OcclusionMaterial()])
+        occluder.orientation = simd_quatf(angle: .pi / 2, axis: [0, 0, 1])
+        anchor.addChild(occluder)
+        
+        arView.scene.addAnchor(anchor)
+        self.watchAnchor = anchor
+    }
+    
+    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        let handler = VNImageRequestHandler(cvPixelBuffer: frame.capturedImage, orientation: .up, options: [:])
+        try? handler.perform([handRequest])
+        
+        guard let observation = handRequest.results?.first else {
+            handleMissingHand()
+            return
+        }
+        
+        // Reset counter and show model if hand is found
+        framesWithoutHand = 0
+        watchEntity?.isEnabled = true
+        updateWatchTransform(in: session, observation: observation)
+    }
+    
+    private func handleMissingHand() {
+        framesWithoutHand += 1
+        // Only hide the watch if it's been gone for a while
+        if framesWithoutHand > maxMissingFrames {
+            watchEntity?.isEnabled = false
+        }
+    }
+    
+    func updateWatchTransform(in session: ARSession, observation: VNHandObservation) {
+        // Lower confidence requirement for "stickier" tracking
+        guard let wrist = try? observation.recognizedPoint(.wrist),
+              let knuckle = try? observation.recognizedPoint(.middleMCP),
+              wrist.confidence > 0.15 else { return }
+        
+        let screenPoint = CGPoint(x: wrist.location.x, y: 1 - wrist.location.y)
+        
+        // Use the ARView from the delegate
+        guard let arView = session.delegate as? ARView else { return }
+        
+        var targetPosition: SIMD3<Float>?
+        
+        // 1. Try Primary Raycast (Accurate)
+        if let result = arView.raycast(from: screenPoint, allowing: .estimatedPlane, alignment: .any).first {
+            targetPosition = simd_make_float3(result.worldTransform.columns.3)
+        } 
+        // 2. Try Fallback (Unproject) if Raycast fails
+        else {
+            // Place watch roughly 35cm from the camera if depth sensing fails
+            targetPosition = arView.unproject(screenPoint, atIndex: 0, ontoPlane: float4x4(translation: [0,0,-0.35]))
+        }
+        
+        guard let finalPosition = targetPosition else { return }
+        
+        // 3. Calculate Orientation (Direction from Wrist to Knuckle)
+        let dirX = Float(knuckle.location.x - wrist.location.x)
+        let dirY = Float(knuckle.location.y - wrist.location.y)
+        let armAngle = atan2(dirY, dirX) - (.pi / 2)
+        
+        let targetRotation = simd_quatf(angle: armAngle, axis: [0, 1, 0])
+        
+        // 4. Smooth the movement (Interpolation)
+        let newTransform = Transform(scale: .one, rotation: targetRotation, translation: finalPosition)
+        
+        // If we have a previous transform, smoothly transition to avoid "jumping"
+        if let last = lastValidTransform {
+            let smoothedTransform = last.interpolate(to: newTransform, by: 0.35) // 0.35 = speed of snap
+            watchAnchor?.move(to: smoothedTransform, relativeTo: nil)
+            lastValidTransform = smoothedTransform
+        } else {
+            watchAnchor?.move(to: newTransform, relativeTo: nil)
+            lastValidTransform = newTransform
+        }
+    }
+}
+
+// Helper for translation matrix
+extension float4x4 {
+    init(translation vector: SIMD3<Float>) {
+        self = matrix_identity_float4x4
+        self.columns.3 = SIMD4<Float>(vector.x, vector.y, vector.z, 1)
+    }
+}
 
