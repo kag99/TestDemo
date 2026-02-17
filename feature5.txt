@@ -1,1 +1,157 @@
 this is feature 5
+
+
+import SwiftUI
+import RealityKit
+import ARKit
+import Vision
+
+struct ARWatchContainer: UIViewRepresentable {
+    
+    func makeUIView(context: Context) -> ARView {
+        let arView = ARView(frame: .zero)
+        
+        // 1. Setup AR Configuration
+        let config = ARWorldTrackingConfiguration()
+        config.frameSemantics = .personSegmentationWithDepth // Helps occlude the watch with the user's hand
+        arView.session.run(config)
+        arView.session.delegate = context.coordinator
+        
+        // 2. Load and add the Watch with Occluder
+        context.coordinator.setupWatch(in: arView)
+        
+        return arView
+    }
+    
+    func updateUIView(_ uiView: ARView, context: Context) {}
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+    
+    class Coordinator: NSObject, ARSessionDelegate {
+        var watchAnchor: AnchorEntity?
+        var watchEntity: Entity?
+        var handRequest = VNDetectHumanHandPoseRequest()
+        
+        func setupWatch(in arView: ARView) {
+            // Create a world anchor
+            let anchor = AnchorEntity(world: .zero)
+            
+            // Load Watch Model (ensure watch.usdz is in your project)
+            if let model = try? Entity.load(named: "watch") {
+                model.name = "WatchModel"
+                anchor.addChild(model)
+                self.watchEntity = model
+            }
+            
+            // Setup Occluder Cylinder (The "invisible" wrist)
+            let occluderMesh = MeshResource.generateCylinder(height: 0.2, radius: 0.032)
+            let occluder = ModelEntity(mesh: occluderMesh, materials: [OcclusionMaterial()])
+            occluder.orientation = simd_quatf(angle: .pi / 2, axis: [0, 0, 1]) // Align with strap
+            anchor.addChild(occluder)
+            
+            arView.scene.addAnchor(anchor)
+            self.watchAnchor = anchor
+        }
+        
+        func session(_ session: ARSession, didUpdate frame: ARFrame) {
+            let handler = VNImageRequestHandler(cvPixelBuffer: frame.capturedImage, orientation: .up, options: [:])
+            
+            try? handler.perform([handRequest])
+            
+            guard let observation = handRequest.results?.first else {
+                watchEntity?.isEnabled = false
+                return
+            }
+            
+            updateWatchTransform(in: session, observation: observation)
+        }
+        
+        func updateWatchTransform(in session: ARSession, observation: VNHandObservation) {
+            // Get Wrist and Knuckle for position and direction
+            guard let wrist = try? observation.recognizedPoint(.wrist),
+                  let knuckle = try? observation.recognizedPoint(.middleMCP),
+                  wrist.confidence > 0.3 else { return }
+            
+            watchEntity?.isEnabled = true
+            
+            // 1. Convert Vision (0-1) to Screen Space
+            let screenPoint = CGPoint(x: wrist.location.x, y: 1 - wrist.location.y)
+            
+            // 2. Raycast to find 3D Position
+            // We use the current frame's raycast to find the depth of the arm
+            if let arView = session.delegate as? ARView,
+               let result = arView.raycast(from: screenPoint, allowing: .estimatedPlane, alignment: .any).first {
+                
+                let position = simd_make_float3(result.worldTransform.columns.3)
+                
+                // 3. Calculate Rotation (Direction of the arm)
+                let angle = atan2(Float(knuckle.location.y - wrist.location.y),
+                                  Float(knuckle.location.x - wrist.location.x)) - (.pi / 2)
+                
+                let rotation = simd_quatf(angle: angle, axis: [0, 1, 0])
+                
+                // 4. Smooth Move
+                let transform = Transform(scale: .one, rotation: rotation, translation: position)
+                watchAnchor?.move(to: transform, relativeTo: nil, duration: 0.05)
+            }
+        }
+    }
+}
+
+
+
+
+struct ContentView: View {
+    @State private var selectedBandColor: Color = .black
+    
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            // The AR View
+            ARWatchContainer()
+                .edgesIgnoringSafeArea(.all)
+            
+            // UI Overlay
+            VStack {
+                Text("Virtual Try-On")
+                    .font(.headline)
+                    .padding()
+                    .background(.ultraThinMaterial)
+                    .cornerRadius(10)
+                
+                Spacer()
+                
+                HStack(spacing: 20) {
+                    BandButton(color: .orange) { changeBand("Orange") }
+                    BandButton(color: .blue) { changeBand("Midnight") }
+                    BandButton(color: .white) { changeBand("Starlight") }
+                }
+                .padding(.bottom, 50)
+            }
+        }
+    }
+    
+    func changeBand(_ named: String) {
+        // Here you would send a notification or use a shared state 
+        // to tell the Coordinator to swap the USDZ model texture/entity.
+        print("Changing band to \(named)")
+    }
+}
+
+struct BandButton: View {
+    let color: Color
+    let action: () -> Void
+    
+    var body: some View {
+        Button(action: action) {
+            Circle()
+                .fill(color)
+                .frame(width: 50, height: 50)
+                .overlay(Circle().stroke(Color.white, lineWidth: 2))
+                .shadow(radius: 5)
+        }
+    }
+}
+
+
