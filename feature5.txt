@@ -2,63 +2,73 @@ import SwiftUI
 import RealityKit
 import ARKit
 
-struct WristTrackerView: UIViewRepresentable {
-    func makeUIView(context: Context) -> ARView {
-        let arView = ARView(frame: .zero)
-        
-        // 1. Start Body Tracking Configuration
-        let config = ARBodyTrackingConfiguration()
-        arView.session.run(config)
-        
-        context.coordinator.arView = arView
-        arView.session.delegate = context.coordinator
-        
-        // 2. Load and prepare the Watch Model
-        if let watch = try? Entity.loadModel(named: "AppleWatch") {
-            watch.name = "UserWatch"
+struct WristWatchView: View {
+    var body: some View {
+        // The RealityView initializer gives us access to the 'content' 
+        // and a 'placeholder' for updates.
+        RealityView { content, attachments in
+            // 1. Create a root entity to hold our watch
+            let rootEntity = Entity()
+            rootEntity.name = "WatchRoot"
             
-            // Create a simple Occlusion Cylinder to hide the strap behind the wrist
-            let occluder = Entity()
-            let mesh = MeshResource.generateCylinder(height: 0.2, radius: 0.03)
-            occluder.components.set(ModelComponent(mesh: mesh, materials: [OcclusionMaterial()]))
-            occluder.orientation = simd_quatf(angle: .pi/2, axis: [0,0,1])
+            // 2. Load the USDZ Model
+            if let watchModel = try? await Entity(contentsOf: Bundle.main.url(forResource: "AppleWatch", withExtension: "usdz")!) {
+                watchModel.name = "WatchModel"
+                
+                // 3. Add an Occluder (Cylinder) to hide the back strap
+                let occluder = Entity()
+                let mesh = MeshResource.generateCylinder(height: 0.2, radius: 0.035)
+                occluder.components.set(ModelComponent(mesh: mesh, materials: [OcclusionMaterial()]))
+                occluder.orientation = simd_quatf(angle: .pi/2, axis: [0,0,1])
+                
+                watchModel.addChild(occluder)
+                rootEntity.addChild(watchModel)
+            }
             
-            watch.addChild(occluder)
+            content.add(rootEntity)
             
-            // Add to a world anchor (we will move it manually)
-            let worldAnchor = AnchorEntity(world: .zero)
-            worldAnchor.addChild(watch)
-            arView.scene.addAnchor(worldAnchor)
+        } update: { content, attachments in
+            // This closure runs when state changes, but for 60fps tracking, 
+            // we use the ARSessionDelegate below.
         }
-        
-        return arView
+        .task {
+            // Start the AR Session for Body Tracking
+            await startARSession()
+        }
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    // MARK: - ARKit Logic
+    private func startARSession() async {
+        let session = ARSession()
+        let delegate = WristCoordinator()
+        session.delegate = delegate
+        
+        let config = ARBodyTrackingConfiguration()
+        session.run(config)
+    }
+}
 
-    class Coordinator: NSObject, ARSessionDelegate {
-        weak var arView: ARView?
+// 4. The Coordinator handles the "Math" of moving the watch to the wrist
+class WristCoordinator: NSObject, ARSessionDelegate {
+    var watchEntity: Entity?
 
-        func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
-            for anchor in anchors {
-                // Look for the Body Anchor
-                guard let bodyAnchor = anchor as? ARBodyAnchor,
-                      let watch = arView?.scene.findEntity(named: "UserWatch") else { continue }
+    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        for anchor in anchors {
+            guard let bodyAnchor = anchor as? ARBodyAnchor else { continue }
+            
+            // Access the skeleton provided by ARKit
+            let skeleton = bodyAnchor.skeleton
+            
+            // Get the wrist transform relative to the body's center
+            if let wristTransform = skeleton.modelTransform(for: .leftWrist) {
                 
-                // Get the Wrist Joint Transform (index 60-70 typically, use named joints for safety)
-                let skeleton = bodyAnchor.skeleton
-                if let wristTransform = skeleton.modelTransform(for: .leftWrist) {
-                    
-                    // Convert local body coordinates to world coordinates
-                    let worldTransform = bodyAnchor.transform * wristTransform
-                    watch.setTransformMatrix(worldTransform, relativeTo: nil)
-                    
-                    // Subtle correction: Lift the watch so it sits on top of the wrist
-                    watch.position.y += 0.02 
-                }
+                // Combine body position in world space with wrist position in body space
+                let worldTransform = bodyAnchor.transform * wristTransform
+                
+                // Apply to our RealityKit Entity
+                // (In a real app, you'd find this entity via a Scene query or Reference)
+                watchEntity?.setTransformMatrix(worldTransform, relativeTo: nil)
             }
         }
     }
-    
-    func updateUIView(_ uiView: ARView, context: Context) {}
 }
